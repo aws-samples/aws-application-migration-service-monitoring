@@ -1,0 +1,496 @@
+#########################################################################################
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.                    #
+# SPDX-License-Identifier: MIT-0                                                        #
+#                                                                                       #
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this  #
+# software and associated documentation files (the "Software"), to deal in the Software #
+# without restriction, including without limitation the rights to use, copy, modify,    #
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to    #
+# permit persons to whom the Software is furnished to do so.                            #
+#                                                                                       #
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,   #
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A         #
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT    #
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION     #
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE        #
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                                #
+#########################################################################################
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CloudFormation Template to Deploy Target Account EventBridge Rules 
+Metadata: 
+  AWS::CloudFormation::Interface: 
+    ParameterGroups: 
+      - 
+        Label: 
+          default: "Central Account info"
+        Parameters: 
+          - CentralEventBusArn
+          - CentralLambdaRoleArn
+      - 
+        Label: 
+          default: "Alarm Metrics Thresholds"
+        Parameters: 
+          - CentralRegion
+          - LagDurationThresholdinSeconds
+          - ElapsedReplnDurationThresholdinSeconds
+      -
+        Label:
+          default: "Config defaults - DO NOT CHANGE"
+        Parameters:
+          - TargetAccountEventRoleName
+          - AlarmLambdaExecutionRoleName
+    ParameterLabels:
+      CentralEventBusArn:
+        default: Central Event Bus ARN
+      LagDurationThresholdinSeconds:
+        default: Lag Duration threshold to fire an alarm (Default 1800 which is 3 hrs)
+      ElapsedReplnDurationThresholdinSeconds:
+        default: ElapsedReplicationDuration threshold to fire an alarm (Default 7776000 which is 90 days)
+      LagDurationPeriodinSeconds:
+        default: Lag Duration Period evaluate the metric or expression to create each individual data point for an alarm
+      ElapsedReplnDurationPeriodinSeconds:
+        default: ElapsedReplicationDuration Period evaluate the metric or expression to create each individual data point for an alarm
+      LagDurationEvaluationPeriod:
+        default: Lag Duration Evaluation Period is the number of the most recent periods, or data points, to evaluate when determining alarm state
+      ElapsedReplnDurationEvaluationPeriod:
+        default: ElapsedReplicationDuration Evaluation Period is the number of the most recent periods, or data points, to evaluate when determining alarm state
+      CentralLambdaRoleArn:
+        default: Central Account Lambda Function Arn
+      CentralRegion:
+        default: Region in which the common IAM Lambda execution roles to be deployed. (Case sensitive)
+Parameters:
+  CentralEventBusArn:
+    Type: String
+  LagDurationThresholdinSeconds:
+    Type: String
+    Default: 3600
+  ElapsedReplnDurationThresholdinSeconds:
+    Type: String
+    Default: 7776000
+  LagDurationPeriodinSeconds:
+    Type: String
+    Default: 300
+  ElapsedReplnDurationPeriodinSeconds:
+    Type: String
+    Default: 300
+  LagDurationEvaluationPeriod:
+    Type: String
+    Default: 1
+  ElapsedReplnDurationEvaluationPeriod:
+    Type: String
+    Default: 1
+  CentralLambdaRoleArn:
+    Type: String
+  CentralRegion:
+    Type: String
+  TargetAccountEventRoleName:
+    Type: String
+    Default: MGN-Monitoring-Generic-EventBridge-Invoke-EventBus-Role
+  CentralAccountLambdaRoleName:
+    Type: String
+    Default: MGN-Monitoring-Generic-Central-Account-Lambda-Role
+  AlarmLambdaExecutionRoleName:
+    Type: String
+    Default: MGN-Monitoring-Generic-Alarm-Lambda-Role
+
+Conditions:
+  DeployIAMRoles: !Equals
+    - !Ref CentralRegion
+    - !Sub "${AWS::Region}"
+
+Resources:
+  # IAM Roles will be deployed only on one of the regions in the account to avoid duplicates/conflict deployment in other regions
+  # Stackset deployment must be sequential with CentralRegion as the first in the sequence just so the roles 
+  # will be available before the other regions deployments.
+  
+  MGNEventsKMSKey:
+    Type: AWS::KMS::Key
+    Properties: 
+      Description: KMS Key for CloudWatch Log Group Encryption
+      Enabled: True
+      EnableKeyRotation: True
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: "Enable IAM User Permissions"
+            Effect: "Allow"
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: "Allow access for Key Administrators"
+            Effect: "Allow"
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:role/Admin"
+            Action: 
+              - "kms:Create*"
+              - "kms:Describe*"
+              - "kms:Enable*"
+              - "kms:List*"
+              - "kms:Put*"
+              - "kms:Update*"
+              - "kms:Revoke*"
+              - "kms:Disable*"
+              - "kms:Get*"
+              - "kms:Delete*"
+              - "kms:TagResource"
+              - "kms:UntagResource"
+              - "kms:ScheduleKeyDeletion"
+              - "kms:CancelKeyDeletion"
+            Resource: "*"
+          - Sid: "Allow use of the key"
+            Effect: "Allow"
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:role/Admin"
+            Action: 
+              - "kms:Encrypt"
+              - "kms:Decrypt*"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey*"
+            Resource: "*"
+          - Sid: "Allow use of the key for CloudWatch Logs and SNS"
+            Effect: "Allow"
+            Principal:
+              Service: 
+                - !Sub "logs.amazonaws.com"
+                - !Sub "sns.amazonaws.com"
+            Action: 
+              - "kms:Encrypt"
+              - "kms:Decrypt*"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey*"
+            Resource: "*"
+          - Sid: "Allow attachment of persistent resources"
+            Effect: "Allow"
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:role/Admin"
+            Action: 
+              - "kms:CreateGrant"
+              - "kms:ListGrants"
+              - "kms:RevokeGrants"
+            Resource: "*"
+            Condition:
+              Bool: 
+                "kms:GrantIsForAWSResource": "true"
+  
+  TargetAccountEventRuleRole:
+    Condition: DeployIAMRoles
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref TargetAccountEventRoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      Description: "Role for Cross Account Event Rule Publishing to Central Event Bus"
+      Policies:
+        - PolicyName: Amazon-EventBridge-Invoke-EventBus-Policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "events:PutEvents"
+                Resource: 
+                  Ref: CentralEventBusArn
+
+  AlarmLambdaExecutionRole:
+    Condition: DeployIAMRoles
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref AlarmLambdaExecutionRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Path: /
+      Policies:
+      - PolicyName: Alarm
+        PolicyDocument:
+          Statement:
+          - Action: 
+              - cloudwatch:PutMetricAlarm
+              - cloudwatch:DeleteAlarms
+              - cloudwatch:DescribeAlarms
+            Effect: Allow
+            Resource: "arn:aws:cloudwatch:*:*:alarm:MGN*"
+      - PolicyName: Log
+        PolicyDocument:
+          Statement:
+          - Action: 
+              - logs:CreateLogGroup
+            Effect: Allow
+            Resource: !Sub "arn:aws:logs:*:${AWS::AccountId}:*"
+      - PolicyName: Events
+        PolicyDocument:
+          Statement:
+          - Action: 
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Effect: Allow
+            Resource: !Sub "arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/lambda/ConfigureMGNAlarms:*"
+      - PolicyName: DeadLetterQueue
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: sqs:SendMessage
+            Resource: !GetAtt LambdaCWAlarmDeadLetterQueue.Arn         
+
+  CentralAccountLambdaRole:
+    Condition: DeployIAMRoles
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref CentralAccountLambdaRoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - Ref: CentralLambdaRoleArn
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      Description: "Role for Cross Account Lambda Function"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSApplicationMigrationReadOnlyAccess
+
+  StalledReplicationEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: mgn-generic-source-server-stalled-events
+      Description: "Events rule for AWS MGN source server stalled events"
+      EventPattern:
+        source: ["aws.mgn"]
+        detail-type: ["MGN Source Server Data Replication Stalled Change"]
+        detail:
+          state:
+            - "STALLED"
+      RoleArn:
+        !If [DeployIAMRoles, !GetAtt TargetAccountEventRuleRole.Arn, !Sub "arn:aws:iam::${AWS::AccountId}:role/${TargetAccountEventRoleName}"]
+      State: ENABLED
+      Targets:
+       - 
+          Arn:
+            Ref: CentralEventBusArn
+          Id: "event-bus-replication-stalled"
+          RoleArn:
+            !If [DeployIAMRoles, !GetAtt TargetAccountEventRuleRole.Arn, !Sub "arn:aws:iam::${AWS::AccountId}:role/${TargetAccountEventRoleName}"]
+
+  IndividualServerMGNMetricAlarmRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: mgn-generic-individual-server-MGN-metric-alarm
+      Description: "Events rule for forwarding individual server's MGN alarm event to CentrlEvent bus"
+      RoleArn:
+        !If [DeployIAMRoles, !GetAtt TargetAccountEventRuleRole.Arn, !Sub "arn:aws:iam::${AWS::AccountId}:role/${TargetAccountEventRoleName}"]
+      EventPattern:
+        source: ["aws.cloudwatch"]
+        detail-type: ["CloudWatch Alarm State Change"]
+        detail: 
+          state:
+            value: 
+              - ALARM
+        resources:
+          -
+            prefix : !Sub "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:MGN"
+      State: ENABLED
+      Targets:
+       - 
+          Arn:  
+            Ref: CentralEventBusArn
+          Id: "event-bus-individual-server-metrics-alarm"
+          RoleArn: 
+            !If [DeployIAMRoles, !GetAtt TargetAccountEventRuleRole.Arn, !Sub "arn:aws:iam::${AWS::AccountId}:role/${TargetAccountEventRoleName}"]
+
+  NewSourceServerAdditionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: "mgn-generic-new-source-server-addition"
+      Description: "Events rule for detecting new source server addition to MGN"
+      EventPattern:
+        source: ["aws.mgn"]
+        detail-type: 
+          - "MGN Source Server Lifecycle State Change"
+        detail:
+          state: 
+            - "READY_FOR_TEST"
+      State: ENABLED
+      Targets:
+       - 
+          Arn:
+            Fn::GetAtt: [ConfigureAlarmLambda, Arn]
+          Id: "event-bus-create-individual-MGN-metric-alarm"
+
+  SourceServerDisconnectRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: mgn-generic-source-server-disconnect
+      Description: "Events rule for detecting source server removal from MGN"
+      EventPattern:
+        source: ["aws.mgn"]
+        detail-type: ["AWS API Call via CloudTrail"]
+        detail:
+          eventName: 
+            - "DisconnectFromService"
+          eventSource:
+            - "mgn.amazonaws.com"
+      State: ENABLED
+      Targets:
+        - 
+          Arn:
+            Fn::GetAtt: [RemoveAlarmLambda, Arn]
+          Id: "event-bus-remove-individual-MGN-metric-alarm"
+        - 
+          Arn:
+            Ref: CentralEventBusArn
+          Id: "event-bus-replication-stalled"
+          RoleArn:
+            !If [DeployIAMRoles, !GetAtt TargetAccountEventRuleRole.Arn, !Sub "arn:aws:iam::${AWS::AccountId}:role/${TargetAccountEventRoleName}"]
+    
+  LambdaCWAlarmDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: MGN-EventHandler-Generic-DeadLetterQueue-Target
+      KmsMasterKeyId: 
+        Fn::GetAtt: [ MGNEventsKMSKey , Arn ]
+      MessageRetentionPeriod: 604800
+
+  ConfigureAlarmLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Configures the Alarms for the new source servers added
+      FunctionName: Generic-Create-MGN-Alarm-For-New-SourceServer
+      Handler: index.lambda_handler
+      Role: !If [DeployIAMRoles, !GetAtt AlarmLambdaExecutionRole.Arn, !Sub "arn:aws:iam::${AWS::AccountId}:role/${AlarmLambdaExecutionRoleName}"]
+      Runtime: python3.8
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaCWAlarmDeadLetterQueue.Arn
+      Timeout: 30
+      ReservedConcurrentExecutions: 100
+      Environment:
+        Variables:
+          LagDuration_Threshold: !Ref LagDurationThresholdinSeconds
+          ElapsedReplicationDuration_Threshold: !Ref ElapsedReplnDurationThresholdinSeconds
+          LagDuration_Period: !Ref LagDurationPeriodinSeconds
+          ElapsedReplicationDuration_Period: !Ref ElapsedReplnDurationPeriodinSeconds
+          LagDuration_EvaluationPeriod: !Ref LagDurationEvaluationPeriod
+          ElapsedReplicationDuration_EvaluationPeriod: !Ref ElapsedReplnDurationEvaluationPeriod
+      Code:
+        ZipFile: |
+          import boto3
+          import botocore.exceptions
+          import logging
+          import os
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def create_alarm(botoclient, sourceServerID, MetricName, Threshold, Period, EvaluationPeriods):
+              try:    
+                  response = botoclient.put_metric_alarm(
+                      AlarmName=f"MGN-{sourceServerID}-{MetricName}",
+                      ComparisonOperator='GreaterThanThreshold',
+                      EvaluationPeriods=EvaluationPeriods,
+                      MetricName=MetricName,
+                      Namespace='AWS/MGN',
+                      Period=Period,
+                      Statistic='Maximum',
+                      Threshold=Threshold,
+                      ActionsEnabled=False,
+                      AlarmDescription=f'Alarm to monitor {MetricName}',
+                      Dimensions=[
+                              {
+                                  'Name': 'SourceServerID',
+                                  'Value': sourceServerID
+                              },
+                          ]
+                  )
+                  logger.info(response)
+              except botocore.exceptions.ClientError as error:
+                  logger.error(error)
+                  logger.error("An error occurred and the creation and/or use of the CloudWatch client via Boto3 failed")
+              except Exception as error:
+                  logger.error(error)
+
+          def lambda_handler(event, context):
+              logger.info(f"Event:{event}")
+              Metrics = [ "LagDuration", "ElapsedReplicationDuration"]
+              sourceServerID = event["resources"][0].split("/")[1]
+              logger.info(f"Received an event to configure alarm for SourceServerId: {sourceServerID}") 
+              client = boto3.client('cloudwatch')
+              for metric in Metrics:
+                  logger.info(f"Creating {metric} Alarm...")
+                  create_alarm(client, sourceServerID, metric, int(os.environ[f'{metric}_Threshold']), int(os.environ[f'{metric}_Period']), int(os.environ[f'{metric}_EvaluationPeriod']))
+   
+
+  ConfigureAlarmLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: Generic-Create-MGN-Alarm-For-New-SourceServer
+      Principal: events.amazonaws.com
+      SourceArn:
+        Fn::GetAtt:
+        - NewSourceServerAdditionRule
+        - Arn
+
+  RemoveAlarmLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Removes the Alarms for source servers disconnected
+      FunctionName: Generic-Remove-MGN-SourceServer-Alarm
+      Handler: index.lambda_handler
+      Role: !If [DeployIAMRoles, !GetAtt AlarmLambdaExecutionRole.Arn, !Sub "arn:aws:iam::${AWS::AccountId}:role/${AlarmLambdaExecutionRoleName}"]
+      Runtime: python3.8
+      Timeout: 30
+      ReservedConcurrentExecutions: 100
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaCWAlarmDeadLetterQueue.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import logging
+          import os
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          def lambda_handler(event, context):
+            logger.info(f"Event:{event}")
+            sourceServerID = event['detail']['requestParameters']['sourceServerID']
+            logger.info(f"Received an event to remove alarm for SourceServerId: {sourceServerID}")         
+            client = boto3.client('cloudwatch')
+            response = client.delete_alarms(
+                AlarmNames=[
+                    f"MGN-{sourceServerID}-LagDuration",
+                    f"MGN-{sourceServerID}-ElapsedReplicationDuration"
+                ]
+            )
+            logger.info(response)
+
+  RemoveAlarmLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: Generic-Remove-MGN-SourceServer-Alarm
+      Principal: events.amazonaws.com
+      SourceArn:
+        Fn::GetAtt:
+        - SourceServerDisconnectRule
+        - Arn

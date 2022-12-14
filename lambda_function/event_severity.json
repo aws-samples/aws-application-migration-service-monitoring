@@ -1,0 +1,6 @@
+{
+    "Stalled": "Critical",
+    "LagDuration": "Critical",
+    "Disconnect": "Major",
+    "ReplicationDuration": "Major"
+}

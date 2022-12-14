@@ -1,0 +1,274 @@
+#########################################################################################
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.                    #
+# SPDX-License-Identifier: MIT-0                                                        #
+#                                                                                       #
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this  #
+# software and associated documentation files (the "Software"), to deal in the Software #
+# without restriction, including without limitation the rights to use, copy, modify,    #
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to    #
+# permit persons to whom the Software is furnished to do so.                            #
+#                                                                                       #
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,   #
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A         #
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT    #
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION     #
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE        #
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                                #
+#########################################################################################
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CloudFormation Template to Deploy Central Account Event Bus 
+Parameters:
+  EventBusPolicyPrincipal:
+    Type: CommaDelimitedList
+    Description: List of Accounts allowed to put events to the Event Bus
+  MGNMonitoringLambdaRoleName:
+    Type: String
+    Default: mgn-monitoring-lambda-event-handler-role-generic
+  SNSSubscriptionEmail:
+    Type: String
+    Description: SNS Subscription Email For Log Events
+  
+    
+Resources:
+  CentralEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: mgn-central-eventbus-generic
+
+  CentralEventBusPolicy:
+    Type: AWS::Events::EventBusPolicy
+    Properties:
+      EventBusName: mgn-central-eventbus-generic
+      StatementId: 
+        Fn::Sub: "mgn-central-account-${AWS::AccountId}-event-bus-policy"
+      Statement:
+        Effect: "Allow"
+        Principal:
+          AWS:
+            Ref: EventBusPolicyPrincipal
+        Action: "events:PutEvents"
+        Resource: 
+          Fn::GetAtt: [ CentralEventBus, Arn ]
+
+  CentralAccountEventRule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: mgn-source-server-stalled-events-generic
+        Description: "Events rule for AWS MGN source server stalled events"
+        EventBusName: mgn-central-eventbus-generic
+        EventPattern:
+          source: ["aws.mgn","aws.cloudwatch"]
+          detail-type: ["MGN Source Server Data Replication Stalled Change", "CloudWatch Alarm State Change", "MGN Source Server Lifecycle State Change"]
+        State: ENABLED
+        Targets:
+        - 
+            Arn:
+              Fn::GetAtt: [EventHandlerFunction, Arn]
+            Id: "central-event-bus-replication-stalled-lambda"
+  
+  LambdaDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: MGN-EventHandler-Generic-DeadLetterQueue
+      KmsMasterKeyId: 
+        Fn::GetAtt: [ MGNEventsKMSKey , Arn ]
+      MessageRetentionPeriod: 604800
+
+  EventHandlerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref MGNMonitoringLambdaRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSApplicationMigrationFullAccess
+        - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+        - arn:aws:iam::aws:policy/AmazonEventBridgeReadOnlyAccess
+      Path: /
+      Policies:
+        - PolicyName: KMS
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Action: 
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              Effect: Allow
+              Resource: !GetAtt MGNEventsKMSKey.Arn
+        - PolicyName: AssumeRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - sts:AssumeRole
+              Resource: "arn:aws:iam::*:role/MGN-Monitoring-Generic-Central-Account-Lambda-Role"
+        - PolicyName: DeadLetterQueue
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !GetAtt LambdaDeadLetterQueue.Arn
+        - PolicyName: SNS
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: 
+                Fn::Sub: "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:MGN-Events-SNS-${AWS::AccountId}-Generic"
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action: 
+                - logs:PutLogEvents
+                - logs:DescribeLogStreams
+              Resource: !GetAtt MGNEventsLogGroup.Arn
+
+  EventHandlerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: MGN-EventHandler-Generic
+      Principal: events.amazonaws.com
+      SourceArn:
+        Fn::GetAtt:
+        - CentralAccountEventRule
+        - Arn
+
+  EventHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Performs Event Handling for MGN and migration related events
+      FunctionName: MGN-EventHandler-Generic
+      Handler: lambda_function.lambda_handler
+      MemorySize: 256
+      DeadLetterConfig:
+        TargetArn: 
+          Fn::GetAtt: [ LambdaDeadLetterQueue, Arn ]
+      ReservedConcurrentExecutions: 100
+      Role: 
+        Fn::GetAtt: [EventHandlerFunctionRole, Arn]
+      Runtime: python3.8
+      Timeout: 60
+      Environment:
+        Variables:
+          EventsCLoudWatchLogGroup: 
+            Fn::Sub: "MGN-Events-Log-Group-${AWS::AccountId}-Generic"
+          EventsSNSTopic: 
+            Fn::Sub: arn:aws:sns:${AWS::Region}:${AWS::AccountId}:MGN-Events-SNS-${AWS::AccountId}-Generic
+      Code: ../lambda_function/
+  
+  MGNEventsKMSKey:
+    Type: AWS::KMS::Key
+    Properties: 
+      Description: KMS Key for CloudWatch Log Group Encryption
+      Enabled: True
+      EnableKeyRotation: True
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: "Enable IAM User Permissions"
+            Effect: "Allow"
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: "Allow access for Key Administrators"
+            Effect: "Allow"
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:role/Admin"
+            Action: 
+              - "kms:Create*"
+              - "kms:Describe*"
+              - "kms:Enable*"
+              - "kms:List*"
+              - "kms:Put*"
+              - "kms:Update*"
+              - "kms:Revoke*"
+              - "kms:Disable*"
+              - "kms:Get*"
+              - "kms:Delete*"
+              - "kms:TagResource"
+              - "kms:UntagResource"
+              - "kms:ScheduleKeyDeletion"
+              - "kms:CancelKeyDeletion"
+            Resource: "*"
+          - Sid: "Allow use of the key"
+            Effect: "Allow"
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:role/Admin"
+            Action: 
+              - "kms:Encrypt"
+              - "kms:Decrypt*"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey*"
+            Resource: "*"
+          - Sid: "Allow use of the key for CloudWatch Logs and SNS"
+            Effect: "Allow"
+            Principal:
+              Service: 
+                - !Sub "logs.amazonaws.com"
+                - !Sub "sns.amazonaws.com"
+            Action: 
+              - "kms:Encrypt"
+              - "kms:Decrypt*"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey*"
+            Resource: "*"
+          - Sid: "Allow attachment of persistent resources"
+            Effect: "Allow"
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:role/Admin"
+            Action: 
+              - "kms:CreateGrant"
+              - "kms:ListGrants"
+              - "kms:RevokeGrants"
+            Resource: "*"
+            Condition:
+              Bool: 
+                "kms:GrantIsForAWSResource": "true"
+
+  MGNEventsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      KmsKeyId: 
+        Fn::GetAtt: [ MGNEventsKMSKey, Arn ]
+      LogGroupName: 
+        Fn::Sub: "MGN-Events-Log-Group-${AWS::AccountId}-Generic"
+      RetentionInDays: 3
+  
+  MGNEventsSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties: 
+      KmsMasterKeyId: 
+        Fn::GetAtt: [ MGNEventsKMSKey , Arn ]
+      Subscription: 
+        - Endpoint: !Ref SNSSubscriptionEmail
+          Protocol: Email
+      TopicName:
+        Fn::Sub: MGN-Events-SNS-${AWS::AccountId}-Generic
+
+Outputs:
+  CentralAccountLambdaRoleArn:
+    Description: Arn for the Central Account Lambda
+    Value:
+      Fn::GetAtt: [EventHandlerFunctionRole, Arn]
+  CentralAccountEventBusArn:
+    Description: Arn for the Central Account Custom Event Bus
+    Value:
+      Fn::GetAtt: [CentralEventBus, Arn]
